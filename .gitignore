@@ -1,0 +1,20 @@
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# CatBoost & ML
+catboost_info/
+*.pkl
+*.joblib
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+data/subset.csv
+
+# OS files
+.DS_Store
+Thumbs.db

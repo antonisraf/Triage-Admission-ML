@@ -163,7 +163,7 @@ val_mean = np.mean(val_scores, axis=1)
 
 # Dashboard Setup
 fig, axes = plt.subplots(2, 4, figsize=(26, 12))
-fig.suptitle('Evaluation Dashboard', fontsize=22, fontweight='bold', y=0.98)
+fig.suptitle('Soft-Voting Evaluation Dashboard', fontsize=22, fontweight='bold', y=0.98)
 
 # ROC & PR Curves
 fpr, tpr, _ = roc_curve(y_test, y_prob_admit, pos_label=0)

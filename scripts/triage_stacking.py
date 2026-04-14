@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import re
 import random
 import lightgbm as lgb
+import joblib
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split, learning_curve
 from sklearn.compose import ColumnTransformer
@@ -152,6 +153,19 @@ axes[1, 2].bar(['Bias', 'Variance', 'MSE'], [bias, var, mse], color=['blue', 're
 axes[1, 3].axis('off')
 axes[1, 3].text(0, 1, f"Best Threshold: {best_t:.2f}\nF2-Score: {max(f2_scores):.4f}\n\n{classification_report(y_test, y_pred)}", fontsize=10, family='monospace', va='top')
 
+# save the model artifacts for future use
+model_artifacts = {
+    'model': calibrated_stacking,
+    'label_encoder': label_enc,
+    'train_median': train_median,
+    'top_100_features': top_100_features,
+    'best_threshold': best_t
+}
+
+joblib.dump(model_artifacts, 'models/stacking_model_artifacts.pkl')
+
+# display the dashboard
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.savefig('plots/stacking_eval.png', dpi=300, bbox_inches='tight')
 plt.show()
+

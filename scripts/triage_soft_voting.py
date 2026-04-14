@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import joblib
 import matplotlib.pyplot as plt
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import VarianceThreshold
@@ -199,6 +200,17 @@ for i, v in enumerate([bias, var, mse]): axes[1, 2].text(i, v + 0.005, f'{v:.3f}
 # Metrics Text
 axes[1, 3].axis('off')
 axes[1, 3].text(-0.1, 1.0, f"F2-Score: {f2_admit:.4f}\n\n{report}", fontsize=10, family='monospace', va='top')
+
+# Save model artifacts for future use
+model_artifacts = {
+    'model': calibrated_model,
+    'label_encoder': label_enc,
+    'train_median': train_median,
+    'top_features': top_features,
+    'best_threshold': best_threshold
+}
+
+joblib.dump(model_artifacts, 'models/soft_voting_artifacts.pkl')
 
 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 # Save the dashboard 

@@ -16,6 +16,7 @@ from sklearn.metrics import (roc_curve, auc, precision_recall_curve, fbeta_score
 from sklearn.calibration import CalibrationDisplay, CalibratedClassifierCV
 from catboost import CatBoostClassifier
 from mlxtend.evaluate import bias_variance_decomp
+from sklearn.model_selection import cross_val_predict
 
 # 1. Load data and initialize target encoding
 df = pd.read_csv('data/subset.csv')
@@ -82,13 +83,13 @@ idx1, idx2, idx3, idx4 = [get_indices(X_train_sel, g) for g in [g1, g2, g3, g4]]
 
 # 7. Model Stacking: Define heterogeneous base learners and an LGBM meta-learner
 base_learners = [
-    ('sub1_lgbm', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx1)], remainder='drop')), ('scaler', StandardScaler()), 
+    ('sub1_lgbm', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx1)], remainder='drop')), 
                              ('clf', lgb.LGBMClassifier(n_estimators=100, scale_pos_weight=ratio, random_state=42, n_jobs=-1))])),
-    ('sub2_rf', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx2)], remainder='drop')), ('scaler', StandardScaler()), 
+    ('sub2_rf', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx2)], remainder='drop')), 
                             ('clf', RandomForestClassifier(n_estimators=100, class_weight='balanced', max_depth=8, random_state=42, n_jobs=-1))])),
-    ('sub3_cat', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx3)], remainder='drop')), ('scaler', StandardScaler()), 
+    ('sub3_cat', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx3)], remainder='drop')), 
                              ('clf', CatBoostClassifier(iterations=200, verbose=0, auto_class_weights='Balanced', depth=4, thread_count=-1))])),
-    ('sub4_cat_alt', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx4)], remainder='drop')), ('scaler', StandardScaler()), 
+    ('sub4_cat_alt', Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx4)], remainder='drop')), 
                                  ('clf', CatBoostClassifier(iterations=200, verbose=0, depth=5, thread_count=-1))]))
 ]
 
@@ -102,10 +103,13 @@ calibrated_stacking = CalibratedClassifierCV(stacking_base, method='isotonic', c
 calibrated_stacking.fit(X_train_sel.values, y_train)
 
 # 9. Performance Evaluation: Optimized threshold search for F-beta score
-y_prob_admit = calibrated_stacking.predict_proba(X_test_sel.values)[:, 0]
+y_prob_train_oof = cross_val_predict(calibrated_stacking, X_train_sel.values, y_train, cv=3, method='predict_proba', n_jobs=-1)[:, 0]
+
 thresholds = np.linspace(0, 1, 100)
-f2_scores = [fbeta_score(y_test, np.where(y_prob_admit > t, 0, 1), beta=1.2, pos_label=0) for t in thresholds]
+f2_scores = [fbeta_score(y_train, np.where(y_prob_train_oof > t, 0, 1), beta=1.2, pos_label=0) for t in thresholds]
 best_t = thresholds[np.argmax(f2_scores)]
+
+y_prob_admit = calibrated_stacking.predict_proba(X_test_sel.values)[:, 0]
 y_pred = np.where(y_prob_admit > best_t, 0, 1)
 
 # Bias-Variance decomposition analysis

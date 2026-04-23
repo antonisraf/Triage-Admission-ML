@@ -18,3 +18,7 @@ data/subset.csv
 # OS files
 .DS_Store
 Thumbs.db
+
+scripts_testing/
+
+plots_testing/ 

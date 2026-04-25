@@ -14,7 +14,6 @@ from sklearn.model_selection import train_test_split, RandomizedSearchCV, learni
 from sklearn.metrics import (roc_curve, auc, precision_recall_curve, fbeta_score, 
                              classification_report, confusion_matrix, roc_auc_score, make_scorer,
                              ConfusionMatrixDisplay)
-from sklearn.calibration import CalibrationDisplay, CalibratedClassifierCV
 from catboost import CatBoostClassifier
 from mlxtend.evaluate import bias_variance_decomp
 
@@ -28,34 +27,36 @@ df = pd.read_csv('data/subset.csv')
 X = df.drop('disposition', axis=1) 
 y = df['disposition']
 
+# Split the data first to avoid leakage in encoding and imputation
+X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(X, y, test_size=0.2, random_state=42)
+
 # Then i transformed my target value into 0/1 where 0 is "Admit" and 1 is "Discharge"
-# Also i transformed every feature into numbers
 label_enc = LabelEncoder()
-y_encoded = label_enc.fit_transform(y)
-df_numeric = pd.get_dummies(X)
+y_train = label_enc.fit_transform(y_train_raw)
+y_test = label_enc.transform(y_test_raw)
 
-# Split the data into 80% training and 20% test 
-# I used stratification in order to have balanced classes for the train/test set
-X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-    df_numeric, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
-)
+# Also i transformed every feature into numbers - Handling categorical columns properly after split
+X_train_numeric = pd.get_dummies(X_train_raw)
+X_test_numeric = pd.get_dummies(X_test_raw)
+# Ensure both sets have the same columns after get_dummies
+X_test_numeric = X_test_numeric.reindex(columns=X_train_numeric.columns, fill_value=0)
 
-# Handled missing values using median imputation 
-train_median = X_train_raw.median()
-X_train_imputed = X_train_raw.fillna(train_median)
-X_test_imputed = X_test_raw.fillna(train_median)
+# Handled missing values using median imputation based only on training data
+train_median = X_train_numeric.median()
+X_train_imputed = X_train_numeric.fillna(train_median)
+X_test_imputed = X_test_numeric.fillna(train_median)
 
  # Feature Selection: Apply Variance Threshold
 selector = VarianceThreshold(threshold=0.01)
 selector.fit(X_train_imputed)
-X_train_sel = pd.DataFrame(selector.transform(X_train_imputed), columns=X_train_raw.columns[selector.get_support()])
-X_test_sel = pd.DataFrame(selector.transform(X_test_imputed), columns=X_train_raw.columns[selector.get_support()])
+X_train_sel = pd.DataFrame(selector.transform(X_train_imputed), columns=X_train_numeric.columns[selector.get_support()])
+X_test_sel = pd.DataFrame(selector.transform(X_test_imputed), columns=X_train_numeric.columns[selector.get_support()])
 
-# Performed a Random forest in order to get the top 100 features
+# Performed a Random forest in order to get the top 150 features
 rf_selector = RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1)
 rf_selector.fit(X_train_sel, y_train)
 importances = pd.Series(rf_selector.feature_importances_, index=X_train_sel.columns)
-top_features = importances.nlargest(100).index.tolist()
+top_features = importances.nlargest(150).index.tolist()
 
 # Split the features into 4 groups based on keywords
 vitals_top = [c for c in top_features if any(w in c.lower() for w in ['vital', 'sbp', 'dbp', 'pulse', 'temp', 'o2', 'hr', 'rr'])]
@@ -79,7 +80,7 @@ base_learners = [
     ('vitals_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
         ('scaler', StandardScaler()), 
-        ('clf', lgb.LGBMClassifier(n_estimators=150, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=31,reg_lambda=10)) 
+        ('clf', lgb.LGBMClassifier(n_estimators=250, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=63,reg_lambda=20)) 
     ])),  
     ('meds_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
@@ -89,12 +90,12 @@ base_learners = [
     ('labs_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=400, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
     ])), 
     ('history_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=400, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
     ]))
 ]
 
@@ -117,9 +118,9 @@ f2_scorer = make_scorer(fbeta_score, beta=2, pos_label=0)
 search = RandomizedSearchCV(estimator=Voting_model, param_distributions=param_distributions, 
                             n_iter=7, cv=3, scoring=f2_scorer, verbose=1, n_jobs=-1, random_state=42)
 search.fit(X_train.values, y_train) 
-#Propability Calibration applied isotonic regression to calibrate the predicted propabilities
-calibrated_model = CalibratedClassifierCV(search.best_estimator_, method='isotonic', cv=3)
-calibrated_model.fit(X_train.values, y_train)
+
+# Final model
+final_model = search.best_estimator_
 
 # Bias-Variance Decomposition (mlxtend)
 sample_size = min(5000, len(X_train))
@@ -128,7 +129,7 @@ X_sample = X_train.values[indices]
 y_sample = y_train[indices]
 
 mse, bias, var = bias_variance_decomp(
-    search.best_estimator_, 
+    final_model, 
     X_sample, y_sample, 
     X_test.values, y_test, 
     loss='0-1_loss', num_rounds=10, random_seed=42
@@ -136,59 +137,57 @@ mse, bias, var = bias_variance_decomp(
 
 # Evaluation 
 
-# Extract probalities for the Admit class
-y_prob_admit = calibrated_model.predict_proba(X_test.values)[:, 0]
-# Try 100 thresholds in order to get the one that maximizes f2 score
-thresholds=np.linspace(0,1,100)
-f2_scores = [fbeta_score(y_test, np.where(y_prob_admit > t, 0, 1), beta=1.2, pos_label=0) for t in thresholds]
-best_threshold = thresholds[np.argmax(f2_scores)]
-best_f2_score = max(f2_scores)
-# Sensitivity threshold to prioritize admissions
-y_pred_custom = np.where(y_prob_admit > best_threshold, 0, 1)
-y_test_admit = (y_test == 0).astype(int)
+# Extract probabilities for the Admit class (index 0) from the search result
+y_prob_train_admit = final_model.predict_proba(X_train.values)[:, 0]
+y_prob_test_admit = final_model.predict_proba(X_test.values)[:, 0]
 
-# f2 scorer
+# Elbow method to find optimal threshold
+precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_train, y_prob_train_admit, pos_label=0)
+distances = np.sqrt((1 - precision_tr)**2 + (1 - recall_tr)**2)
+best_threshold = thresholds_tr[np.argmin(distances)]
+
+# Final predictions using the elbow-optimized threshold
+y_pred_custom = np.where(y_prob_test_admit > best_threshold, 0, 1)
+
+# Metrics for reporting
 f2_admit = fbeta_score(y_test, y_pred_custom, beta=2, pos_label=0)
-# Classification report
 report = classification_report(y_test, y_pred_custom, target_names=label_enc.classes_)
-# Confusion Matrix
 cm = confusion_matrix(y_test, y_pred_custom)
 
-# Learning Curve
+# Learning Curve using the best estimator
 train_sizes, train_scores, val_scores = learning_curve(
-    estimator=calibrated_model, X=X_train.values, y=y_train, train_sizes=np.linspace(0.1, 1.0, 5),
+    estimator=final_model, X=X_train.values, y=y_train, train_sizes=np.linspace(0.1, 1.0, 5),
     cv=3, scoring=f2_scorer, n_jobs=-1, random_state=42
 )
 train_mean = np.mean(train_scores, axis=1)
 val_mean = np.mean(val_scores, axis=1)
 
-# Dashboard Setup
-fig, axes = plt.subplots(2, 4, figsize=(26, 12))
+# Dashboard Setup (Removed Calibration Plot)
+fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 fig.suptitle('Soft-Voting Evaluation Dashboard', fontsize=22, fontweight='bold', y=0.98)
 
-# ROC & PR Curves
-fpr, tpr, _ = roc_curve(y_test, y_prob_admit, pos_label=0)
+# ROC Curve
+fpr, tpr, _ = roc_curve(y_test, y_prob_test_admit, pos_label=0)
 axes[0, 0].plot(fpr, tpr, color='blue', label=f'AUC = {auc(fpr, tpr):.2f}')
 axes[0, 0].set_title('ROC Curve'); axes[0, 0].legend()
 
-precision, recall, _ = precision_recall_curve(y_test, y_prob_admit, pos_label=0)
-axes[0, 1].plot(recall, precision, color='red', label=f'AUC = {auc(recall, precision):.3f}')
-axes[0, 1].set_title('Precision-Recall Curve'); axes[0, 1].legend()
+# PR Curve with Elbow
+axes[0, 1].plot(recall_tr, precision_tr, color='red', label='PR Curve (Train)')
+idx = np.argmin(distances)
+axes[0, 1].scatter(recall_tr[idx], precision_tr[idx], color='black', s=100, label=f'Elbow (t={best_threshold:.2f})', zorder=5)
+axes[0, 1].set_title('Precision-Recall Curve (Elbow)'); axes[0, 1].legend()
 
 # Expert Performance
-expert_names = [name.replace('_expert', '') for name, _ in calibrated_model.estimator.estimators]
-expert_aucs = [roc_auc_score(y_test, calibrated_model.estimator.estimators_[i].predict_proba(X_test.values)[:, 1]) for i in range(len(expert_names))]
+expert_names = [name.replace('_expert', '') for name, _ in final_model.estimators]
+expert_aucs = [roc_auc_score(y_test, final_model.estimators_[i].predict_proba(X_test.values)[:, 1]) for i in range(len(expert_names))]
 axes[0, 2].bar(expert_names, expert_aucs, color='skyblue')
 axes[0, 2].set_title('AUC per Expert')
 
 # Confusion Matrix
-ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_enc.classes_).plot(ax=axes[0, 3], cmap='Blues')
-axes[0, 3].set_title('Confusion Matrix')
+ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_enc.classes_).plot(ax=axes[1, 0], cmap='Blues')
+axes[1, 0].set_title('Confusion Matrix')
 
-# Calibration & Learning Curves
-CalibrationDisplay.from_predictions(y_test_admit, y_prob_admit, n_bins=10, ax=axes[1, 0])
-axes[1, 0].set_title('Calibration')
-
+# Learning Curve
 axes[1, 1].plot(train_sizes, train_mean, label='Train'); axes[1, 1].plot(train_sizes, val_mean, label='Val')
 axes[1, 1].set_title('Learning Curve'); axes[1, 1].legend()
 
@@ -197,23 +196,23 @@ axes[1, 2].bar(['Bias', 'Variance', 'MSE'], [bias, var, mse], color=['blue', 're
 axes[1, 2].set_title('Bias-Variance Decomposition')
 for i, v in enumerate([bias, var, mse]): axes[1, 2].text(i, v + 0.005, f'{v:.3f}', ha='center')
 
-# Metrics Text
-axes[1, 3].axis('off')
-axes[1, 3].text(-0.1, 1.0, f"F2-Score: {f2_admit:.4f}\n\n{report}", fontsize=10, family='monospace', va='top')
+# Metrics Text 
+plt.figtext(0.85, 0.25, f"Elbow Threshold: {best_threshold:.2f}\nF2-Score: {f2_admit:.4f}\n\n{report}", 
+            fontsize=10, family='monospace', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+
+plt.tight_layout(rect=[0, 0.03, 0.85, 0.95])
 
 # Save model artifacts for future use
 model_artifacts = {
-    'model': calibrated_model,
+    'model': final_model,             
     'label_encoder': label_enc,
     'train_median': train_median,
+    'selector': selector,              
     'top_features': top_features,
     'best_threshold': best_threshold
 }
 
 joblib.dump(model_artifacts, 'models/soft_voting_artifacts.pkl')
 
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-# Save the dashboard 
 plt.savefig('plots/soft_voting_eval.png', dpi=300, bbox_inches='tight')
-# Show the dashboard
 plt.show()

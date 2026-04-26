@@ -80,7 +80,7 @@ base_learners = [
     ('vitals_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
         ('scaler', StandardScaler()), 
-        ('clf', lgb.LGBMClassifier(n_estimators=250, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=63,reg_lambda=20)) 
+        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=31,reg_lambda=20)) 
     ])),  
     ('meds_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
@@ -90,12 +90,12 @@ base_learners = [
     ('labs_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=400, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
     ])), 
     ('history_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=400, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
     ]))
 ]
 

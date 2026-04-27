@@ -80,7 +80,7 @@ base_learners = [
     ('vitals_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
         ('scaler', StandardScaler()), 
-        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=31,reg_lambda=20)) 
+        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=31,reg_lambda=10)) 
     ])),  
     ('meds_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
@@ -90,24 +90,17 @@ base_learners = [
     ('labs_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=8 ,thread_count=-1))
     ])), 
     ('history_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=6 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=8,thread_count=-1))
     ]))
 ]
 
 #  Hyperparameter grid for RandomizedSearchCV 
-param_distributions = {'weights': [
-        [1.5, 2.0, 0.3, 2.5],
-        [1.0, 2.5, 0.2, 3.0],
-        [2.0, 1.5, 0.3, 2.0],
-        [1.2, 2.2, 0.4, 2.8],
-        [0.5, 3.0, 0.1, 3.5],
-        [1.0, 2.0,0.05, 3.0] 
-    ]}
+param_distributions = {'weights': np.random.uniform(0.5, 2.0, (10, 4)).tolist()}
 
 # Initialize the Voting Classifier with 'soft' voting
 Voting_model = VotingClassifier(estimators=base_learners, voting='soft')

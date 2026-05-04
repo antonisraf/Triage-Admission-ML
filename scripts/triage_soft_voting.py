@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
-import joblib
 import matplotlib.pyplot as plt
+import optuna 
+import joblib
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.ensemble import RandomForestClassifier
@@ -10,7 +11,7 @@ from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 from sklearn.pipeline import Pipeline  
 from sklearn.ensemble import VotingClassifier
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, learning_curve
+from sklearn.model_selection import train_test_split, learning_curve, cross_val_score 
 from sklearn.metrics import (roc_curve, auc, precision_recall_curve, fbeta_score, 
                              classification_report, confusion_matrix, roc_auc_score, make_scorer,
                              ConfusionMatrixDisplay)
@@ -75,58 +76,78 @@ meds_idx = get_indices(X_train, meds_top)
 labs_idx = get_indices(X_train, labs_top)
 history_idx = get_indices(X_train, history_top)
 
-# Base learners for each team of features
-base_learners = [
+# Create Custom Scorer for the admission class
+f2_scorer = make_scorer(fbeta_score, beta=2, pos_label=0)
+
+# Optuna objective function
+def objective(trial):
+    # Weight to favor the Admit class (0)
+    admit_weight = trial.suggest_float('admit_weight', 1.5, 3.0)
+    
+    lgb_lr = trial.suggest_float('lgb_lr', 0.03, 0.08)
+    lgb_reg = trial.suggest_float('lgb_reg', 5.0, 15.0)
+    log_c = trial.suggest_float('log_c', 0.5, 5.0)
+    cat_depth = trial.suggest_int('cat_depth', 5, 9) 
+    cat_lr = trial.suggest_float('cat_lr', 0.03, 0.08)
+
+    base_learners_trial = [
+        ('vitals_expert', Pipeline([
+            ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
+            ('scaler', StandardScaler()), 
+            ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=lgb_lr, reg_lambda=lgb_reg, scale_pos_weight=admit_weight, random_state=42, n_jobs=-1, verbosity=-1)) 
+        ])),  
+        ('meds_expert', Pipeline([
+            ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
+            ('scaler', StandardScaler()),
+            ('clf', LogisticRegression(max_iter=500, C=log_c, class_weight={0: admit_weight, 1: 1}, random_state=42, n_jobs=-1))
+        ])), 
+        ('labs_expert', Pipeline([
+            ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
+            ('scaler', StandardScaler()),
+            ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, scale_pos_weight=admit_weight, thread_count=-1))
+        ])), 
+        ('history_expert', Pipeline([
+            ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
+            ('scaler', StandardScaler()),
+            ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, scale_pos_weight=admit_weight, thread_count=-1))
+        ]))
+    ]
+    
+    Voting_model = VotingClassifier(estimators=base_learners_trial, voting='soft')
+    score = cross_val_score(Voting_model, X_train.values, y_train, cv=3, scoring=f2_scorer, n_jobs=-1)
+    return score.mean()
+
+# Bayesian Optimization
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=20)
+
+# Final model with best parameters
+bp = study.best_params
+base_learners_final = [
     ('vitals_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
         ('scaler', StandardScaler()), 
-        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05, random_state=42, n_jobs=-1, verbosity=-1,num_leaves=31,reg_lambda=10)) 
+        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=bp['lgb_lr'], reg_lambda=bp['lgb_reg'], scale_pos_weight=bp['admit_weight'], random_state=42, n_jobs=-1, verbosity=-1)) 
     ])),  
     ('meds_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(max_iter=1000, random_state=42, C=1, n_jobs=-1))
+        ('clf', LogisticRegression(max_iter=500, C=bp['log_c'], class_weight={0: bp['admit_weight'], 1: 1}, random_state=42, n_jobs=-1))
     ])), 
     ('labs_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=8 ,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], scale_pos_weight=bp['admit_weight'], thread_count=-1))
     ])), 
     ('history_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=300, verbose=0,learning_rate=0.05,depth=8,thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], scale_pos_weight=bp['admit_weight'], thread_count=-1))
     ]))
 ]
 
-#  Hyperparameter grid for RandomizedSearchCV 
-param_distributions = {'weights': np.random.uniform(0.5, 2.0, (10, 4)).tolist()}
-
-# Initialize the Voting Classifier with 'soft' voting
-Voting_model = VotingClassifier(estimators=base_learners, voting='soft')
-
-# Create Custom Scorer for the admission class
-f2_scorer = make_scorer(fbeta_score, beta=2, pos_label=0)
-# Perform Randomized Search Cross-Validation (3-fold) to find the best hyperparameter combination.
-search = RandomizedSearchCV(estimator=Voting_model, param_distributions=param_distributions, 
-                            n_iter=7, cv=3, scoring=f2_scorer, verbose=1, n_jobs=-1, random_state=42)
-search.fit(X_train.values, y_train) 
-
-# Final model
-final_model = search.best_estimator_
-
-# Bias-Variance Decomposition (mlxtend)
-sample_size = min(5000, len(X_train))
-indices = np.random.choice(len(X_train), sample_size, replace=False)
-X_sample = X_train.values[indices]
-y_sample = y_train[indices]
-
-mse, bias, var = bias_variance_decomp(
-    final_model, 
-    X_sample, y_sample, 
-    X_test.values, y_test, 
-    loss='0-1_loss', num_rounds=10, random_seed=42
-)
+final_model = VotingClassifier(estimators=base_learners_final, voting='soft')
+final_model.fit(X_train.values, y_train)
 
 # Evaluation 
 
@@ -138,9 +159,10 @@ y_prob_test_admit = final_model.predict_proba(X_test.values)[:, 0]
 precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_train, y_prob_train_admit, pos_label=0)
 distances = np.sqrt((1 - precision_tr)**2 + (1 - recall_tr)**2)
 best_threshold = thresholds_tr[np.argmin(distances)]
+final_threshold = best_threshold - 0.05 # Nudging down for better Admit Recall
 
-# Final predictions using the elbow-optimized threshold
-y_pred_custom = np.where(y_prob_test_admit > best_threshold, 0, 1)
+# Final predictions using the adjusted threshold
+y_pred_custom = np.where(y_prob_test_admit > final_threshold, 0, 1)
 
 # Metrics for reporting
 f2_admit = fbeta_score(y_test, y_pred_custom, beta=2, pos_label=0)
@@ -157,7 +179,7 @@ val_mean = np.mean(val_scores, axis=1)
 
 # Dashboard Setup (Removed Calibration Plot)
 fig, axes = plt.subplots(2, 3, figsize=(22, 12))
-fig.suptitle('Soft-Voting Evaluation Dashboard', fontsize=22, fontweight='bold', y=0.98)
+fig.suptitle('Soft-Voting Evaluation Dashboard ', fontsize=22, fontweight='bold', y=0.98)
 
 # ROC Curve
 fpr, tpr, _ = roc_curve(y_test, y_prob_test_admit, pos_label=0)
@@ -167,8 +189,8 @@ axes[0, 0].set_title('ROC Curve'); axes[0, 0].legend()
 # PR Curve with Elbow
 axes[0, 1].plot(recall_tr, precision_tr, color='red', label='PR Curve (Train)')
 idx = np.argmin(distances)
-axes[0, 1].scatter(recall_tr[idx], precision_tr[idx], color='black', s=100, label=f'Elbow (t={best_threshold:.2f})', zorder=5)
-axes[0, 1].set_title('Precision-Recall Curve (Elbow)'); axes[0, 1].legend()
+axes[0, 1].scatter(recall_tr[idx], precision_tr[idx], color='black', s=100, label=f'Elbow Point', zorder=5)
+axes[0, 1].set_title('Precision-Recall Curve'); axes[0, 1].legend()
 
 # Expert Performance
 expert_names = [name.replace('_expert', '') for name, _ in final_model.estimators]
@@ -185,27 +207,33 @@ axes[1, 1].plot(train_sizes, train_mean, label='Train'); axes[1, 1].plot(train_s
 axes[1, 1].set_title('Learning Curve'); axes[1, 1].legend()
 
 # Bias-Variance Bar Chart
+sample_size = min(5000, len(X_train))
+indices = np.random.choice(len(X_train), sample_size, replace=False)
+mse, bias, var = bias_variance_decomp(
+    final_model, 
+    X_train.values[indices], y_train[indices], 
+    X_test.values, y_test, 
+    loss='0-1_loss', num_rounds=5, random_seed=42
+)
 axes[1, 2].bar(['Bias', 'Variance', 'MSE'], [bias, var, mse], color=['blue', 'red', 'green'], alpha=0.7)
 axes[1, 2].set_title('Bias-Variance Decomposition')
 for i, v in enumerate([bias, var, mse]): axes[1, 2].text(i, v + 0.005, f'{v:.3f}', ha='center')
 
-# Metrics Text 
-plt.figtext(0.85, 0.25, f"Elbow Threshold: {best_threshold:.2f}\nF2-Score: {f2_admit:.4f}\n\n{report}", 
-            fontsize=10, family='monospace', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
-
-plt.tight_layout(rect=[0, 0.03, 0.85, 0.95])
-
-# Save model artifacts for future use
 model_artifacts = {
-    'model': final_model,             
+    'model': final_model,
     'label_encoder': label_enc,
     'train_median': train_median,
-    'selector': selector,              
     'top_features': top_features,
-    'best_threshold': best_threshold
+    'final_threshold': final_threshold
 }
 
 joblib.dump(model_artifacts, 'models/soft_voting_artifacts.pkl')
+
+# Metrics Text 
+plt.figtext(0.85, 0.25, f"Applied Threshold: {final_threshold:.2f}\nF2-Score: {f2_admit:.4f}\n\n{report}", 
+            fontsize=10, family='monospace', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
+
+plt.tight_layout(rect=[0, 0.03, 0.85, 0.95])
 
 plt.savefig('plots/soft_voting_eval.png', dpi=300, bbox_inches='tight')
 plt.show()

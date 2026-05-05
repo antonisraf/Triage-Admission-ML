@@ -82,7 +82,7 @@ f2_scorer = make_scorer(fbeta_score, beta=2, pos_label=0)
 # Optuna objective function
 def objective(trial):
     # Weight to favor the Admit class (0)
-    admit_weight = trial.suggest_float('admit_weight', 1.5, 3.0)
+    admit_weight = trial.suggest_float('admit_weight', 1.0, 2.0)
     
     lgb_lr = trial.suggest_float('lgb_lr', 0.03, 0.08)
     lgb_reg = trial.suggest_float('lgb_reg', 5.0, 15.0)
@@ -159,7 +159,7 @@ y_prob_test_admit = final_model.predict_proba(X_test.values)[:, 0]
 precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_train, y_prob_train_admit, pos_label=0)
 distances = np.sqrt((1 - precision_tr)**2 + (1 - recall_tr)**2)
 best_threshold = thresholds_tr[np.argmin(distances)]
-final_threshold = best_threshold - 0.05 # Nudging down for better Admit Recall
+final_threshold = best_threshold  
 
 # Final predictions using the adjusted threshold
 y_pred_custom = np.where(y_prob_test_admit > final_threshold, 0, 1)

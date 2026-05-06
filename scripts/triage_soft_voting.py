@@ -159,7 +159,7 @@ y_prob_test_admit = final_model.predict_proba(X_test.values)[:, 0]
 precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_train, y_prob_train_admit, pos_label=0)
 distances = np.sqrt((1 - precision_tr)**2 + (1 - recall_tr)**2)
 best_threshold = thresholds_tr[np.argmin(distances)]
-final_threshold = best_threshold - 0.05 #Nudging down for better Admit Recall 
+final_threshold = best_threshold + 0.05 
 
 # Final predictions using the adjusted threshold
 y_pred_custom = np.where(y_prob_test_admit > final_threshold, 0, 1)
@@ -177,7 +177,7 @@ train_sizes, train_scores, val_scores = learning_curve(
 train_mean = np.mean(train_scores, axis=1)
 val_mean = np.mean(val_scores, axis=1)
 
-# Dashboard Setup (Removed Calibration Plot)
+# Dashboard Setup 
 fig, axes = plt.subplots(2, 3, figsize=(22, 12))
 fig.suptitle('Soft-Voting Evaluation Dashboard ', fontsize=22, fontweight='bold', y=0.98)
 

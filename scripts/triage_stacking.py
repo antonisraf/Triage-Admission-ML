@@ -102,11 +102,12 @@ stacking_model = StackingClassifier(estimators=base_learners, final_estimator=me
 print("Training Stacking model...")
 stacking_model.fit(X_train_sel.values, y_train)
 
-# 8. Evaluation & Threshold (Elbow)
+# 8. Evaluation & Threshold
 y_prob_train_oof = cross_val_predict(stacking_model, X_train_sel.values, y_train, cv=3, method='predict_proba', n_jobs=-1)[:, 0]
 prec_tr, rec_tr, thresh_tr = precision_recall_curve(y_train, y_prob_train_oof, pos_label=0)
-distances = np.sqrt((1 - prec_tr)**2 + (1 - rec_tr)**2)
-best_t = thresh_tr[np.argmin(distances)]
+distances = rec_tr - (1 - prec_tr)
+best_t = thresh_tr[np.argmax(distances)]
+
 
 y_prob_admit = stacking_model.predict_proba(X_test_sel.values)[:, 0]
 y_pred = np.where(y_prob_admit > best_t, 0, 1)
@@ -124,8 +125,7 @@ axes[0, 0].set_title('ROC Curve'); axes[0, 0].legend()
 
 axes[0, 1].plot(rec_tr, prec_tr, color='red', label='PR Curve (Train)')
 idx_e = np.argmin(distances)
-axes[0, 1].scatter(rec_tr[idx_e], prec_tr[idx_e], color='black', s=100, label=f'Elbow (t={best_t:.2f})', zorder=5)
-axes[0, 1].set_title('Precision-Recall Curve (Elbow)'); axes[0, 1].legend()
+axes[0, 1].set_title('Precision-Recall Curve '); axes[0, 1].legend()
 
 expert_aucs = []
 for name, est in stacking_model.named_estimators_.items():
@@ -149,7 +149,7 @@ for i, v in enumerate([bias, var, mse]): axes[1, 2].text(i, v + 0.005, f'{v:.3f}
 
 axes[1, 3].axis('off')
 report = classification_report(y_test, y_pred, target_names=label_enc.classes_)
-metrics_text = f"Elbow Threshold: {best_t:.2f}\nF2-Score: {fbeta_score(y_test, y_pred, beta=2, pos_label=0):.4f}\n\n{report}"
+metrics_text = f"Youden J Threshold: {best_t:.2f}\nF2-Score: {fbeta_score(y_test, y_pred, beta=2, pos_label=0):.4f}\n\n{report}"
 axes[1, 3].text(-0.1, 1.0, metrics_text, fontsize=10, family='monospace', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
 
 model_artifacts = {

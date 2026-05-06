@@ -14,6 +14,7 @@ __pycache__/
 *.pyc
 
 data/subset.csv
+data/1stproject-TestSet.csv
 
 # OS files
 .DS_Store

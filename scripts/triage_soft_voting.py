@@ -8,6 +8,8 @@ from sklearn.feature_selection import VarianceThreshold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score, recall_score
+from sklearn.calibration import CalibratedClassifierCV
 import lightgbm as lgb
 from sklearn.pipeline import Pipeline  
 from sklearn.ensemble import VotingClassifier
@@ -17,6 +19,7 @@ from sklearn.metrics import (roc_curve, auc, precision_recall_curve, fbeta_score
                              ConfusionMatrixDisplay)
 from catboost import CatBoostClassifier
 from mlxtend.evaluate import bias_variance_decomp
+
 
 # I reduced the dataset to 40% of the original size and saved it as 'subset.csv'
 
@@ -28,29 +31,35 @@ df = pd.read_csv('data/subset.csv')
 X = df.drop('disposition', axis=1) 
 y = df['disposition']
 
-# Split the data first to avoid leakage in encoding and imputation
-X_train_raw, X_test_raw, y_train_raw, y_test_raw = train_test_split(X, y, test_size=0.2, random_state=42)
+
+X_train_raw, X_temp, y_train_raw, y_temp = train_test_split(X, y, test_size=0.30, random_state=42)
+X_val_raw, X_test_raw, y_val_raw, y_test_raw = train_test_split(X_temp, y_temp, test_size=0.50, random_state=42)
 
 # Then i transformed my target value into 0/1 where 0 is "Admit" and 1 is "Discharge"
 label_enc = LabelEncoder()
 y_train = label_enc.fit_transform(y_train_raw)
+y_val = label_enc.transform(y_val_raw)
 y_test = label_enc.transform(y_test_raw)
 
 # Also i transformed every feature into numbers - Handling categorical columns properly after split
 X_train_numeric = pd.get_dummies(X_train_raw)
+X_val_numeric = pd.get_dummies(X_val_raw)
 X_test_numeric = pd.get_dummies(X_test_raw)
 # Ensure both sets have the same columns after get_dummies
+X_val_numeric = X_val_numeric.reindex(columns=X_train_numeric.columns, fill_value=0)
 X_test_numeric = X_test_numeric.reindex(columns=X_train_numeric.columns, fill_value=0)
 
 # Handled missing values using median imputation based only on training data
 train_median = X_train_numeric.median()
 X_train_imputed = X_train_numeric.fillna(train_median)
+X_val_imputed = X_val_numeric.fillna(train_median)
 X_test_imputed = X_test_numeric.fillna(train_median)
 
- # Feature Selection: Apply Variance Threshold
+# Feature Selection: Apply Variance Threshold
 selector = VarianceThreshold(threshold=0.01)
 selector.fit(X_train_imputed)
 X_train_sel = pd.DataFrame(selector.transform(X_train_imputed), columns=X_train_numeric.columns[selector.get_support()])
+X_val_sel = pd.DataFrame(selector.transform(X_val_imputed), columns=X_train_numeric.columns[selector.get_support()])
 X_test_sel = pd.DataFrame(selector.transform(X_test_imputed), columns=X_train_numeric.columns[selector.get_support()])
 
 # Performed a Random forest in order to get the top 150 features
@@ -66,6 +75,7 @@ labs_top = [c for c in top_features if any(w in c.lower() for w in ['median', 'm
 history_top = [c for c in top_features if c not in vitals_top + meds_top + labs_top]
 
 X_train = X_train_sel[top_features]
+X_val = X_val_sel[top_features]
 X_test = X_test_sel[top_features]
 
 def get_indices(df, col_list):
@@ -76,14 +86,17 @@ meds_idx = get_indices(X_train, meds_top)
 labs_idx = get_indices(X_train, labs_top)
 history_idx = get_indices(X_train, history_top)
 
-# Create Custom Scorer for the admission class
-f2_scorer = make_scorer(fbeta_score, beta=2, pos_label=0)
+
+def custom_admit_scorer(y_true, y_pred):
+    prec = precision_score(y_true, y_pred, pos_label=0, zero_division=0)
+    if prec < 0.45:
+        return fbeta_score(y_true, y_pred, beta=2, pos_label=0) * ((prec / 0.45) ** 2)
+    return fbeta_score(y_true, y_pred, beta=2, pos_label=0)
+
+f2_scorer = make_scorer(custom_admit_scorer)
 
 # Optuna objective function
 def objective(trial):
-    # Weight to favor the Admit class (0)
-    admit_weight = trial.suggest_float('admit_weight', 1.5, 3.0)
-    
     lgb_lr = trial.suggest_float('lgb_lr', 0.03, 0.08)
     lgb_reg = trial.suggest_float('lgb_reg', 5.0, 15.0)
     log_c = trial.suggest_float('log_c', 0.5, 5.0)
@@ -93,23 +106,20 @@ def objective(trial):
     base_learners_trial = [
         ('vitals_expert', Pipeline([
             ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
-            ('scaler', StandardScaler()), 
-            ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=lgb_lr, reg_lambda=lgb_reg, scale_pos_weight=admit_weight, random_state=42, n_jobs=-1, verbosity=-1)) 
+            ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=lgb_lr, reg_lambda=lgb_reg, random_state=42, n_jobs=-1, verbosity=-1)) 
         ])),  
         ('meds_expert', Pipeline([
             ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
             ('scaler', StandardScaler()),
-            ('clf', LogisticRegression(max_iter=500, C=log_c, class_weight={0: admit_weight, 1: 1}, random_state=42, n_jobs=-1))
+            ('clf', LogisticRegression(max_iter=500, C=log_c, random_state=42, n_jobs=-1))
         ])), 
         ('labs_expert', Pipeline([
             ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
-            ('scaler', StandardScaler()),
-            ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, scale_pos_weight=admit_weight, thread_count=-1))
+            ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, thread_count=-1))
         ])), 
         ('history_expert', Pipeline([
             ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
-            ('scaler', StandardScaler()),
-            ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, scale_pos_weight=admit_weight, thread_count=-1))
+            ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, thread_count=-1))
         ]))
     ]
     
@@ -118,7 +128,8 @@ def objective(trial):
     return score.mean()
 
 # Bayesian Optimization
-study = optuna.create_study(direction='maximize')
+sampler = optuna.samplers.TPESampler(seed=42)
+study = optuna.create_study(direction='maximize', sampler=sampler)
 study.optimize(objective, n_trials=20)
 
 # Final model with best parameters
@@ -126,40 +137,47 @@ bp = study.best_params
 base_learners_final = [
     ('vitals_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
-        ('scaler', StandardScaler()), 
-        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=bp['lgb_lr'], reg_lambda=bp['lgb_reg'], scale_pos_weight=bp['admit_weight'], random_state=42, n_jobs=-1, verbosity=-1)) 
+        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=bp['lgb_lr'], reg_lambda=bp['lgb_reg'], random_state=42, n_jobs=-1, verbosity=-1)) 
     ])),  
     ('meds_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(max_iter=500, C=bp['log_c'], class_weight={0: bp['admit_weight'], 1: 1}, random_state=42, n_jobs=-1))
+        ('clf', LogisticRegression(max_iter=500, C=bp['log_c'], random_state=42, n_jobs=-1))
     ])), 
     ('labs_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
-        ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], scale_pos_weight=bp['admit_weight'], thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], thread_count=-1))
     ])), 
     ('history_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
-        ('scaler', StandardScaler()),
-        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], scale_pos_weight=bp['admit_weight'], thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], thread_count=-1))
     ]))
 ]
 
 final_model = VotingClassifier(estimators=base_learners_final, voting='soft')
 final_model.fit(X_train.values, y_train)
 
-# Evaluation 
+calibrated_model = CalibratedClassifierCV(final_model, method='isotonic', cv=None, ensemble=False)
+calibrated_model.fit(X_val.values, y_val)
 
-# Extract probabilities for the Admit class (index 0) from the search result
-y_prob_train_admit = final_model.predict_proba(X_train.values)[:, 0]
-y_prob_test_admit = final_model.predict_proba(X_test.values)[:, 0]
+# Extract probabilities για το Admit class (index 0) από το calibrated model
+y_prob_train_admit = calibrated_model.predict_proba(X_train.values)[:, 0]
+y_prob_val_admit = calibrated_model.predict_proba(X_val.values)[:, 0]
+y_prob_test_admit = calibrated_model.predict_proba(X_test.values)[:, 0]
 
-# Elbow method to find optimal threshold
-precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_train, y_prob_train_admit, pos_label=0)
-distances = np.sqrt((1 - precision_tr)**2 + (1 - recall_tr)**2)
-best_threshold = thresholds_tr[np.argmin(distances)]
-final_threshold = best_threshold + 0.05 
+thresholds_to_try = np.arange(0.20, 0.65, 0.01)
+best_thresh, best_f2 = 0.5, 0
+
+for t in thresholds_to_try:
+    preds = np.where(y_prob_val_admit > t, 0, 1)
+    prec = precision_score(y_val, preds, pos_label=0, zero_division=0)
+    if prec < 0.45:
+        continue
+    score = fbeta_score(y_val, preds, beta=2, pos_label=0)
+    if score > best_f2:
+        best_f2, best_thresh = score, t
+
+final_threshold = best_thresh
 
 # Final predictions using the adjusted threshold
 y_pred_custom = np.where(y_prob_test_admit > final_threshold, 0, 1)
@@ -186,10 +204,9 @@ fpr, tpr, _ = roc_curve(y_test, y_prob_test_admit, pos_label=0)
 axes[0, 0].plot(fpr, tpr, color='blue', label=f'AUC = {auc(fpr, tpr):.2f}')
 axes[0, 0].set_title('ROC Curve'); axes[0, 0].legend()
 
-# PR Curve with Elbow
-axes[0, 1].plot(recall_tr, precision_tr, color='red', label='PR Curve (Train)')
-idx = np.argmin(distances)
-axes[0, 1].scatter(recall_tr[idx], precision_tr[idx], color='black', s=100, label=f'Elbow Point', zorder=5)
+# PR Curve
+precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_val, y_prob_val_admit, pos_label=0)
+axes[0, 1].plot(recall_tr, precision_tr, color='red', label='PR Curve (Val)')
 axes[0, 1].set_title('Precision-Recall Curve'); axes[0, 1].legend()
 
 # Expert Performance
@@ -220,7 +237,7 @@ axes[1, 2].set_title('Bias-Variance Decomposition')
 for i, v in enumerate([bias, var, mse]): axes[1, 2].text(i, v + 0.005, f'{v:.3f}', ha='center')
 
 model_artifacts = {
-    'model': final_model,
+    'model': calibrated_model,
     'label_encoder': label_enc,
     'train_median': train_median,
     'top_features': top_features,

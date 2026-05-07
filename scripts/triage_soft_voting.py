@@ -130,7 +130,7 @@ def objective(trial):
 # Bayesian Optimization
 sampler = optuna.samplers.TPESampler(seed=42)
 study = optuna.create_study(direction='maximize', sampler=sampler)
-study.optimize(objective, n_trials=20)
+study.optimize(objective, n_trials=15)
 
 # Final model with best parameters
 bp = study.best_params

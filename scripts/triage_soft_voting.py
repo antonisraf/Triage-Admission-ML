@@ -6,7 +6,7 @@ import joblib
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score, recall_score
 from sklearn.calibration import CalibratedClassifierCV
@@ -19,7 +19,7 @@ from sklearn.metrics import (roc_curve, auc, precision_recall_curve, fbeta_score
                              ConfusionMatrixDisplay)
 from catboost import CatBoostClassifier
 from mlxtend.evaluate import bias_variance_decomp
-
+from sklearn.impute import SimpleImputer
 
 # I reduced the dataset to 40% of the original size and saved it as 'subset.csv'
 
@@ -31,36 +31,64 @@ df = pd.read_csv('data/subset.csv')
 X = df.drop('disposition', axis=1) 
 y = df['disposition']
 
-
 X_train_raw, X_temp, y_train_raw, y_temp = train_test_split(X, y, test_size=0.30, random_state=42)
 X_val_raw, X_test_raw, y_val_raw, y_test_raw = train_test_split(X_temp, y_temp, test_size=0.50, random_state=42)
 
+
 # Then i transformed my target value into 0/1 where 0 is "Admit" and 1 is "Discharge"
+
 label_enc = LabelEncoder()
 y_train = label_enc.fit_transform(y_train_raw)
 y_val = label_enc.transform(y_val_raw)
 y_test = label_enc.transform(y_test_raw)
 
-# Also i transformed every feature into numbers - Handling categorical columns properly after split
-X_train_numeric = pd.get_dummies(X_train_raw)
-X_val_numeric = pd.get_dummies(X_val_raw)
-X_test_numeric = pd.get_dummies(X_test_raw)
-# Ensure both sets have the same columns after get_dummies
-X_val_numeric = X_val_numeric.reindex(columns=X_train_numeric.columns, fill_value=0)
-X_test_numeric = X_test_numeric.reindex(columns=X_train_numeric.columns, fill_value=0)
+# Setting up the preprocessing pipelines for numeric and categorical features
+numeric_cols = X_train_raw.select_dtypes(include=['int64', 'float64']).columns.tolist()
+categorical_cols = X_train_raw.select_dtypes(include=['object', 'category']).columns.tolist()
 
-# Handled missing values using median imputation based only on training data
-train_median = X_train_numeric.median()
-X_train_imputed = X_train_numeric.fillna(train_median)
-X_val_imputed = X_val_numeric.fillna(train_median)
-X_test_imputed = X_test_numeric.fillna(train_median)
+numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median'))
+])
+
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')), 
+    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+])
+
+preprocessor = ColumnTransformer(transformers=[
+    ('num', numeric_transformer, numeric_cols),
+    ('cat', categorical_transformer, categorical_cols)
+], verbose_feature_names_out=False)
+
+# Change the output from array to pandas dataframe
+preprocessor.set_output(transform="pandas")
+
+
+preprocessor.fit(X_train_raw)
+
+# Transform the datasets
+X_train_processed_arr = preprocessor.transform(X_train_raw)
+X_val_processed_arr = preprocessor.transform(X_val_raw)
+X_test_processed_arr = preprocessor.transform(X_test_raw)
+
+# Get feature names after transformation
+cat_names = preprocessor.named_transformers_['cat']['onehot'].get_feature_names_out(categorical_cols)
+all_feature_names = numeric_cols + list(cat_names)
+
+# Convert the processed arrays back to DataFrames with appropriate column names
+X_train_processed = pd.DataFrame(X_train_processed_arr, columns=all_feature_names, index=X_train_raw.index)
+X_val_processed = pd.DataFrame(X_val_processed_arr, columns=all_feature_names, index=X_val_raw.index)
+X_test_processed = pd.DataFrame(X_test_processed_arr, columns=all_feature_names, index=X_test_raw.index)
 
 # Feature Selection: Apply Variance Threshold
 selector = VarianceThreshold(threshold=0.01)
-selector.fit(X_train_imputed)
-X_train_sel = pd.DataFrame(selector.transform(X_train_imputed), columns=X_train_numeric.columns[selector.get_support()])
-X_val_sel = pd.DataFrame(selector.transform(X_val_imputed), columns=X_train_numeric.columns[selector.get_support()])
-X_test_sel = pd.DataFrame(selector.transform(X_test_imputed), columns=X_train_numeric.columns[selector.get_support()])
+selector.fit(X_train_processed)
+
+# Get the columns that passed the variance threshold
+selected_cols = X_train_processed.columns[selector.get_support()]
+X_train_sel = X_train_processed[selected_cols]
+X_val_sel = X_val_processed[selected_cols]
+X_test_sel = X_test_processed[selected_cols]
 
 # Performed a Random forest in order to get the top 150 features
 rf_selector = RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1)
@@ -86,22 +114,22 @@ meds_idx = get_indices(X_train, meds_top)
 labs_idx = get_indices(X_train, labs_top)
 history_idx = get_indices(X_train, history_top)
 
-
 def custom_admit_scorer(y_true, y_pred):
     prec = precision_score(y_true, y_pred, pos_label=0, zero_division=0)
-    if prec < 0.45:
-        return fbeta_score(y_true, y_pred, beta=2, pos_label=0) * ((prec / 0.45) ** 2)
+    if prec < 0.35:
+        return fbeta_score(y_true, y_pred, beta=2, pos_label=0) * ((prec / 0.35) ** 2)
     return fbeta_score(y_true, y_pred, beta=2, pos_label=0)
 
 f2_scorer = make_scorer(custom_admit_scorer)
 
 # Optuna objective function
 def objective(trial):
-    lgb_lr = trial.suggest_float('lgb_lr', 0.03, 0.08)
-    lgb_reg = trial.suggest_float('lgb_reg', 5.0, 15.0)
-    log_c = trial.suggest_float('log_c', 0.5, 5.0)
-    cat_depth = trial.suggest_int('cat_depth', 5, 9) 
-    cat_lr = trial.suggest_float('cat_lr', 0.03, 0.08)
+    lgb_lr = trial.suggest_float('lgb_lr', 0.01, 0.1,log=True)
+    lgb_reg = trial.suggest_float('lgb_reg', 1.0, 20.0,log=True)
+    log_c = trial.suggest_float('log_c', 0.001, 100.0,log=True)
+    cat_depth = trial.suggest_int('cat_depth', 4, 8) 
+    cat_lr = trial.suggest_float('cat_lr', 0.01, 0.1,log=True)
+    
 
     base_learners_trial = [
         ('vitals_expert', Pipeline([
@@ -122,40 +150,41 @@ def objective(trial):
             ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=cat_lr, depth=cat_depth, thread_count=-1))
         ]))
     ]
-    
+
     Voting_model = VotingClassifier(estimators=base_learners_trial, voting='soft')
-    score = cross_val_score(Voting_model, X_train.values, y_train, cv=3, scoring=f2_scorer, n_jobs=-1)
+    score = cross_val_score(Voting_model, X_train.values, y_train, cv=3, scoring='average_precision', n_jobs=-1)
     return score.mean()
 
 # Bayesian Optimization
 sampler = optuna.samplers.TPESampler(seed=42)
 study = optuna.create_study(direction='maximize', sampler=sampler)
-study.optimize(objective, n_trials=15)
+study.optimize(objective, n_trials=20)
 
 # Final model with best parameters
 bp = study.best_params
 base_learners_final = [
     ('vitals_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', vitals_idx)], remainder='drop')),
-        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=bp['lgb_lr'], reg_lambda=bp['lgb_reg'], random_state=42, n_jobs=-1, verbosity=-1)) 
+        ('clf', lgb.LGBMClassifier(n_estimators=200, learning_rate=bp['lgb_lr'], reg_lambda=bp['lgb_reg'], class_weight='balanced',random_state=42, n_jobs=-1, verbosity=-1)) 
     ])),  
     ('meds_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', meds_idx)], remainder='drop')),
         ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(max_iter=500, C=bp['log_c'], random_state=42, n_jobs=-1))
+        ('clf', LogisticRegression(max_iter=500, C=bp['log_c'],class_weight='balanced', random_state=42, n_jobs=-1))
     ])), 
     ('labs_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', labs_idx)], remainder='drop')),
-        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'],thread_count=-1,random_seed=42))
     ])), 
     ('history_expert', Pipeline([
         ('sel', ColumnTransformer([('keep', 'passthrough', history_idx)], remainder='drop')),
-        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], thread_count=-1))
+        ('clf', CatBoostClassifier(iterations=250, verbose=0, learning_rate=bp['cat_lr'], depth=bp['cat_depth'], thread_count=-1,random_seed=42))
     ]))
 ]
 
 final_model = VotingClassifier(estimators=base_learners_final, voting='soft')
 final_model.fit(X_train.values, y_train)
+
 
 calibrated_model = CalibratedClassifierCV(final_model, method='isotonic', cv=None, ensemble=False)
 calibrated_model.fit(X_val.values, y_val)
@@ -171,7 +200,7 @@ best_thresh, best_f2 = 0.5, 0
 for t in thresholds_to_try:
     preds = np.where(y_prob_val_admit > t, 0, 1)
     prec = precision_score(y_val, preds, pos_label=0, zero_division=0)
-    if prec < 0.45:
+    if prec < 0.35:
         continue
     score = fbeta_score(y_val, preds, beta=2, pos_label=0)
     if score > best_f2:
@@ -181,6 +210,7 @@ final_threshold = best_thresh
 
 # Final predictions using the adjusted threshold
 y_pred_custom = np.where(y_prob_test_admit > final_threshold, 0, 1)
+
 
 # Metrics for reporting
 f2_admit = fbeta_score(y_test, y_pred_custom, beta=2, pos_label=0)
@@ -197,21 +227,23 @@ val_mean = np.mean(val_scores, axis=1)
 
 # Dashboard Setup 
 fig, axes = plt.subplots(2, 3, figsize=(22, 12))
-fig.suptitle('Soft-Voting Evaluation Dashboard ', fontsize=22, fontweight='bold', y=0.98)
+fig.suptitle('Soft-Voting Evaluation Dashboard', fontsize=22, fontweight='bold', y=0.98)
 
 # ROC Curve
 fpr, tpr, _ = roc_curve(y_test, y_prob_test_admit, pos_label=0)
 axes[0, 0].plot(fpr, tpr, color='blue', label=f'AUC = {auc(fpr, tpr):.2f}')
-axes[0, 0].set_title('ROC Curve'); axes[0, 0].legend()
+axes[0, 0].set_title('ROC Curve')
+axes[0, 0].legend()
 
 # PR Curve
 precision_tr, recall_tr, thresholds_tr = precision_recall_curve(y_val, y_prob_val_admit, pos_label=0)
 axes[0, 1].plot(recall_tr, precision_tr, color='red', label='PR Curve (Val)')
-axes[0, 1].set_title('Precision-Recall Curve'); axes[0, 1].legend()
+axes[0, 1].set_title('Precision-Recall Curve')
+axes[0, 1].legend()
 
-# Expert Performance
+# AUC per Expert
 expert_names = [name.replace('_expert', '') for name, _ in final_model.estimators]
-expert_aucs = [roc_auc_score(y_test, final_model.estimators_[i].predict_proba(X_test.values)[:, 1]) for i in range(len(expert_names))]
+expert_aucs = [roc_auc_score(y_test, final_model.estimators_[i].predict_proba(X_test.values)[:, 0]) for i in range(len(expert_names))]
 axes[0, 2].bar(expert_names, expert_aucs, color='skyblue')
 axes[0, 2].set_title('AUC per Expert')
 
@@ -220,10 +252,12 @@ ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_enc.classes_).p
 axes[1, 0].set_title('Confusion Matrix')
 
 # Learning Curve
-axes[1, 1].plot(train_sizes, train_mean, label='Train'); axes[1, 1].plot(train_sizes, val_mean, label='Val')
-axes[1, 1].set_title('Learning Curve'); axes[1, 1].legend()
+axes[1, 1].plot(train_sizes, train_mean, label='Train')
+axes[1, 1].plot(train_sizes, val_mean, label='Val')
+axes[1, 1].set_title('Learning Curve')
+axes[1, 1].legend()
 
-# Bias-Variance Bar Chart
+# Bias Varinace Bar Chart
 sample_size = min(5000, len(X_train))
 indices = np.random.choice(len(X_train), sample_size, replace=False)
 mse, bias, var = bias_variance_decomp(
@@ -234,12 +268,13 @@ mse, bias, var = bias_variance_decomp(
 )
 axes[1, 2].bar(['Bias', 'Variance', 'MSE'], [bias, var, mse], color=['blue', 'red', 'green'], alpha=0.7)
 axes[1, 2].set_title('Bias-Variance Decomposition')
-for i, v in enumerate([bias, var, mse]): axes[1, 2].text(i, v + 0.005, f'{v:.3f}', ha='center')
+for i, v in enumerate([bias, var, mse]): 
+    axes[1, 2].text(i, v + 0.005, f'{v:.3f}', ha='center')
 
 model_artifacts = {
+    'preprocessor': preprocessor,
     'model': calibrated_model,
     'label_encoder': label_enc,
-    'train_median': train_median,
     'top_features': top_features,
     'final_threshold': final_threshold
 }

@@ -9,7 +9,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler, OneHotEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score, recall_score
-from sklearn.calibration import CalibratedClassifierCV
 import lightgbm as lgb
 from sklearn.pipeline import Pipeline  
 from sklearn.ensemble import VotingClassifier
@@ -90,11 +89,11 @@ X_train_sel = X_train_processed[selected_cols]
 X_val_sel = X_val_processed[selected_cols]
 X_test_sel = X_test_processed[selected_cols]
 
-# Performed a Random forest in order to get the top 150 features
-rf_selector = RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1)
+# Performed a Random forest in order to get the top 100 features
+rf_selector = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
 rf_selector.fit(X_train_sel, y_train)
 importances = pd.Series(rf_selector.feature_importances_, index=X_train_sel.columns)
-top_features = importances.nlargest(150).index.tolist()
+top_features = importances.nlargest(100).index.tolist()
 
 # Split the features into 4 groups based on keywords
 vitals_top = [c for c in top_features if any(w in c.lower() for w in ['vital', 'sbp', 'dbp', 'pulse', 'temp', 'o2', 'hr', 'rr'])]
@@ -116,8 +115,8 @@ history_idx = get_indices(X_train, history_top)
 
 def custom_admit_scorer(y_true, y_pred):
     prec = precision_score(y_true, y_pred, pos_label=0, zero_division=0)
-    if prec < 0.35:
-        return fbeta_score(y_true, y_pred, beta=2, pos_label=0) * ((prec / 0.35) ** 2)
+    if prec < 0.60:
+        return fbeta_score(y_true, y_pred, beta=2, pos_label=0) * ((prec / 0.60) ** 2)
     return fbeta_score(y_true, y_pred, beta=2, pos_label=0)
 
 f2_scorer = make_scorer(custom_admit_scorer)
@@ -130,6 +129,10 @@ def objective(trial):
     cat_depth = trial.suggest_int('cat_depth', 4, 8) 
     cat_lr = trial.suggest_float('cat_lr', 0.01, 0.1,log=True)
     
+    w_vit = trial.suggest_int('w_vit', 1, 5)
+    w_med = trial.suggest_int('w_med', 1, 5)
+    w_lab = trial.suggest_int('w_lab', 1, 5)
+    w_his = trial.suggest_int('w_his', 1, 5)
 
     base_learners_trial = [
         ('vitals_expert', Pipeline([
@@ -151,14 +154,14 @@ def objective(trial):
         ]))
     ]
 
-    Voting_model = VotingClassifier(estimators=base_learners_trial, voting='soft')
+    Voting_model = VotingClassifier(estimators=base_learners_trial, voting='soft', weights=[w_vit, w_med, w_lab, w_his])
     score = cross_val_score(Voting_model, X_train.values, y_train, cv=3, scoring='average_precision', n_jobs=-1)
     return score.mean()
 
 # Bayesian Optimization
 sampler = optuna.samplers.TPESampler(seed=42)
 study = optuna.create_study(direction='maximize', sampler=sampler)
-study.optimize(objective, n_trials=20)
+study.optimize(objective, n_trials=15)
 
 # Final model with best parameters
 bp = study.best_params
@@ -182,17 +185,13 @@ base_learners_final = [
     ]))
 ]
 
-final_model = VotingClassifier(estimators=base_learners_final, voting='soft')
+final_model = VotingClassifier(estimators=base_learners_final, voting='soft', weights=[bp['w_vit'], bp['w_med'], bp['w_lab'], bp['w_his']])
 final_model.fit(X_train.values, y_train)
 
 
-calibrated_model = CalibratedClassifierCV(final_model, method='isotonic', cv=None, ensemble=False)
-calibrated_model.fit(X_val.values, y_val)
-
-# Extract probabilities για το Admit class (index 0) από το calibrated model
-y_prob_train_admit = calibrated_model.predict_proba(X_train.values)[:, 0]
-y_prob_val_admit = calibrated_model.predict_proba(X_val.values)[:, 0]
-y_prob_test_admit = calibrated_model.predict_proba(X_test.values)[:, 0]
+y_prob_train_admit = final_model.predict_proba(X_train.values)[:, 0]
+y_prob_val_admit = final_model.predict_proba(X_val.values)[:, 0]
+y_prob_test_admit = final_model.predict_proba(X_test.values)[:, 0]
 
 thresholds_to_try = np.arange(0.20, 0.65, 0.01)
 best_thresh, best_f2 = 0.5, 0
@@ -200,7 +199,7 @@ best_thresh, best_f2 = 0.5, 0
 for t in thresholds_to_try:
     preds = np.where(y_prob_val_admit > t, 0, 1)
     prec = precision_score(y_val, preds, pos_label=0, zero_division=0)
-    if prec < 0.35:
+    if prec < 0.60:
         continue
     score = fbeta_score(y_val, preds, beta=2, pos_label=0)
     if score > best_f2:
@@ -273,7 +272,7 @@ for i, v in enumerate([bias, var, mse]):
 
 model_artifacts = {
     'preprocessor': preprocessor,
-    'model': calibrated_model,
+    'model': final_model,
     'label_encoder': label_enc,
     'top_features': top_features,
     'final_threshold': final_threshold

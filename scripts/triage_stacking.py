@@ -70,8 +70,110 @@ lgb_selector.fit(X_fs, y_fs)
 top_100_features = pd.Series(lgb_selector.feature_importances_, index=X_train_dum.columns).nlargest(100).index.tolist()
 X_train_sel = X_train_dum[top_100_features].copy()
 X_test_sel = X_test_dum[top_100_features].copy()
+# 5b. Feature Engineering (post-selection, guaranteed input to all learners)
+def engineer_features(df):
+    d = df.copy()
 
-# 6. Feature Subspacing
+    # ESI borderline zone — admits με μέτρια σοβαρότητα που χάνονται
+    if 'num__esi' in d.columns:
+        d['fe_esi_critical']   = (d['num__esi'] <= 2).astype('int8')
+        d['fe_esi_borderline'] = (d['num__esi'] == 3).astype('int8')
+
+    # CV burden χωρίς age bias — αντικατάσταση fe_age_cv_burden
+    if 'num__meds_cardiovascular' in d.columns:
+        d['fe_cv_meds_high'] = (d['num__meds_cardiovascular'] > 2).astype('int8')
+
+    if 'num__age' in d.columns and 'num__meds_cardiovascular' in d.columns:
+        d['fe_cv_burden_per_decade'] = d['num__meds_cardiovascular'] / (d['num__age'] / 10 + 1e-9)
+        d['fe_young_no_cv']          = ((d['num__age'] < 60) & (d['num__meds_cardiovascular'] == 0)).astype('int8')
+        d['fe_frailty_proxy'] = (d['num__age'] / 100) * (d.filter(like='meds').sum(axis=1) + 1)
+
+    # Composite FN-targeted feature — ESI=3 + νέος + abdominal pain
+    if all(c in d.columns for c in ['num__esi', 'num__age', 'num__cc_abdominalpain']):
+        d['fe_fn_risk'] = (
+            (d['num__esi'] == 3).astype(int) *
+            (d['num__age'] < 60).astype(int) *
+            (d['num__cc_abdominalpain'] > 0).astype(int)
+        ).astype('int8')
+        d['fe_abdominal_high_risk'] = ((d['num__cc_abdominalpain'] > 0) & (d['num__esi'] <= 3)).astype('int8')
+
+    # Metabolic stress — FN έχουν κανονική γλυκόζη/BUN, το μοντέλο τους θεωρεί υγιείς
+    if 'num__glucose_median' in d.columns and 'num__bun_max' in d.columns:
+        d['fe_metabolic_stress']  = ((d['num__glucose_median'] > 140) & (d['num__bun_max'] > 20)).astype('int8')
+        d['fe_glucose_bun_ratio'] = d['num__glucose_median'] / (d['num__bun_max'] + 1e-9)
+
+    # Admission history score — FN έχουν χαμηλό ιστορικό, μοντέλο δεν τους admit
+    if 'cat__previousdispo_Admit' in d.columns and 'num__n_admissions' in d.columns:
+        d['fe_admission_history'] = d['cat__previousdispo_Admit'] * np.log1p(d['num__n_admissions'])
+
+    # Hemodynamic instability floor — FN έχουν καλύτερα floors, μοντέλο τους αφήνει
+    if 'num__dbp_min' in d.columns and 'num__spo2_min' in d.columns:
+        d['fe_hemodynamic_instability'] = ((d['num__dbp_min'] < 60) | (d['num__spo2_min'] < 94)).astype('int8')
+        d['fe_dbp_spo2_combined']       = d['num__dbp_min'] * d['num__spo2_min'] / 100
+
+    # GYN/Pregnancy admit risk — pregtestur + ESI<=3
+    if 'num__pregtestur_count' in d.columns and 'num__esi' in d.columns:
+        d['fe_gyn_admit_risk'] = (
+            (d['num__pregtestur_count'] > 0) &
+            (d['num__esi'] <= 3)
+        ).astype('int8')
+
+    # Abdominal pain με borderline severity — κυρίαρχο FN pattern
+    if 'num__cc_abdominalpain' in d.columns and 'num__esi' in d.columns:
+        d['fe_abdominal_esi3'] = (
+            (d['num__cc_abdominalpain'] > 0) &
+            (d['num__esi'] == 3)
+        ).astype('int8')
+
+    # Pattern A — Altered consciousness / neurological (enrichment 2.3x-4.3x)
+    neuro_cols = ['num__cc_unresponsive', 'num__cc_alteredmentalstatus',
+                  'num__cc_lethargy', 'num__cc_strokealert', 'num__cc_hallucinations']
+    present_neuro = [c for c in neuro_cols if c in d.columns]
+    if present_neuro and 'num__esi' in d.columns:
+        d['fe_neuro_esi34'] = (
+            (d[present_neuro].sum(axis=1) > 0) &
+            (d['num__esi'].between(3, 4))
+        ).astype('int8')
+
+    # Pattern B — Infectious / immunocompromised (enrichment 2.3x-3.6x)
+    infect_cols = ['num__cc_fever_75yearsorolder', 'num__cc_respiratorydistress',
+                   'num__cc_feverimmunocompromised', 'num__cc_cellulitis',
+                   'num__cc_follow_upcellulitis']
+    present_infect = [c for c in infect_cols if c in d.columns]
+    if present_infect and 'num__age' in d.columns and 'num__esi' in d.columns:
+        d['fe_infectious_risk'] = (
+            (d[present_infect].sum(axis=1) > 0) &
+            (d['num__esi'].between(3, 4))
+        ).astype('int8')
+        d['fe_elderly_infectious'] = (
+            (d[present_infect].sum(axis=1) > 0) &
+            (d['num__age'] >= 75)
+        ).astype('int8')
+
+    # Pattern C — GI / alcohol / systemic (enrichment 2.5x-3.2x)
+    gi_alc_cols = ['num__cc_emesis', 'num__cc_epigastricpain',
+                   'num__cc_alcoholproblem', 'num__cc_withdrawal_alcohol']
+    present_gi = [c for c in gi_alc_cols if c in d.columns]
+    if present_gi and 'num__esi' in d.columns:
+        d['fe_gi_alc_esi34'] = (
+            (d[present_gi].sum(axis=1) > 0) &
+            (d['num__esi'].between(3, 4))
+        ).astype('int8')
+    
+    if 'num__age' in d.columns and 'num__meds_cardiovascular' in d.columns:
+        d['fe_stealth_elderly'] = (
+            (d['num__age'] >= 65) & 
+            (d['num__meds_cardiovascular'] == 0) & 
+            (d['num__esi'] == 3)
+        ).astype('int8')
+
+    return d
+X_train_sel = engineer_features(X_train_sel)
+X_test_sel  = engineer_features(X_test_sel)
+
+engineered_features = [c for c in X_train_sel.columns if c.startswith('fe_')]
+
+# 6. Feature Subspacing (only over top_100, not engineered features)
 random.seed(22669234)
 top_5_anchors = top_100_features[:5]
 remaining_95 = [f for f in top_100_features if f not in top_5_anchors]
@@ -86,10 +188,13 @@ def build_group(base, pool, target_size=55):
 
 g1, g2, g3, g4, g5 = [top_5_anchors + build_group(b, remaining_95) for b in [b1, b2, b3, b4, b5]]
 
+# Each group = subspace cols + all engineered features (guaranteed)
+g1e, g2e, g3e, g4e, g5e = [g + engineered_features for g in [g1, g2, g3, g4, g5]]
+
 def get_indices(df, col_list):
     return [df.columns.get_loc(c) for c in col_list]
 
-idx1, idx2, idx3, idx4, idx5 = [get_indices(X_train_sel, g) for g in [g1, g2, g3, g4, g5]]
+idx1, idx2, idx3, idx4, idx5 = [get_indices(X_train_sel, g) for g in [g1e, g2e, g3e, g4e, g5e]]
 
 # 7. Model Stacking
 class_ratio = ((y_train == 1).sum() / (y_train == 0).sum()) * 1.2
@@ -114,7 +219,7 @@ def objective(trial):
         ('sub5_xgb',  Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx5)], remainder='drop')),
                                  ('clf', XGBClassifier(n_estimators=150, learning_rate=xgb_lr, scale_pos_weight=class_ratio, eval_metric='logloss', random_state=42, n_jobs=1, verbosity=0))]))
     ]
-    meta = lgb.LGBMClassifier(n_estimators=100, learning_rate=meta_lr, scale_pos_weight=class_ratio, random_state=42, n_jobs=-1, verbosity=-1)
+    meta = LogisticRegression(max_iter=1000)
     stack = StackingClassifier(estimators=bases, final_estimator=meta, cv=2, stack_method='predict_proba', n_jobs=-1)
 
     X_tr_opt, X_val_opt, y_tr_opt, y_val_opt = train_test_split(X_proxy, y_proxy, test_size=0.2, stratify=y_proxy, random_state=42)
@@ -124,11 +229,11 @@ def objective(trial):
     f2_o = (5 * prec_o[:-1] * rec_o[:-1]) / (4 * prec_o[:-1] + rec_o[:-1] + 1e-9)
     t_o = thresh_o[np.argmax(f2_o)]
     y_pred_o = np.where(y_prob_opt > t_o, 0, 1)
-    return fbeta_score(y_val_opt, y_pred_o, beta=2, pos_label=0)
+    return fbeta_score(y_val_opt, y_pred_o, beta=1.5, pos_label=0)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-study.optimize(objective, n_trials=10) 
+study.optimize(objective, n_trials=40) 
 
 bp = study.best_params
 
@@ -144,17 +249,13 @@ base_learners = [
     ('sub5_xgb',     Pipeline([('sel', ColumnTransformer([('k', 'passthrough', idx5)], remainder='drop')),
                                 ('clf', XGBClassifier(n_estimators=200, learning_rate=bp['xgb_lr'], scale_pos_weight=class_ratio, eval_metric='logloss', random_state=42, n_jobs=-1, verbosity=0))]))
 ]
-meta_model = lgb.LGBMClassifier(n_estimators=200, learning_rate=bp['meta_lr'], scale_pos_weight=class_ratio, random_state=42, n_jobs=-1, verbosity=-1)
+meta_model = LogisticRegression(max_iter=1000)
 stacking_model = StackingClassifier(estimators=base_learners, final_estimator=meta_model, cv=2, stack_method='predict_proba', n_jobs=-1)
 
 # Training
 stacking_model.fit(X_train_sel.values, y_train)
 
-# 9. Evaluation & Threshold
-# ── THRESHOLD SEARCH ΜΕ RECALL CONSTRAINT ΣΤΟ VALIDATION SET ────────────────
-# Βρίσκουμε το threshold που μεγιστοποιεί το F2 με constraint recall >= 0.50
-# Το search γίνεται στο validation set (A+B) ώστε το test set να μην αγγίζεται.
-
+#  Evaluation & Threshold
 X_val_processed = preprocessor.transform(X_val_raw)
 cols_val = preprocessor.get_feature_names_out()
 cols_val = [re.sub(r'[\[\]<>,:{}\"]', '_', c) for c in cols_val]
@@ -162,20 +263,30 @@ X_val_dum = pd.DataFrame(X_val_processed, columns=cols_val, index=X_val_raw.inde
 bool_cols_val = X_val_dum.select_dtypes(include=['uint8', 'bool']).columns
 X_val_dum[bool_cols_val] = X_val_dum[bool_cols_val].astype('int8')
 X_val_sel = X_val_dum[top_100_features].copy()
+X_val_sel = engineer_features(X_val_sel)
 
-y_prob_val = stacking_model.predict_proba(X_val_sel.values)[:, 0]
+train_prior = 0.30
+test_prior  = 0.15
+
+def correct_prior(p, train_prior, test_prior):
+    odds = p / (1 - p + 1e-9)
+    corrected_odds = odds * (test_prior / train_prior) / ((1 - test_prior) / (1 - train_prior))
+    return corrected_odds / (1 + corrected_odds)
+
+y_prob_val_raw = stacking_model.predict_proba(X_val_sel.values)[:, 0]
+y_prob_val = y_prob_val_raw
 
 best_t, best_f2 = 0.5, 0
-for t in np.arange(0.05, 0.65, 0.01):
+for t in np.arange(0.4, 0.75, 0.01):
     preds = np.where(y_prob_val > t, 0, 1)
-    score = fbeta_score(y_val, preds, beta=2, pos_label=0)
+    score = fbeta_score(y_val, preds, beta=1.5, pos_label=0)
     if score > best_f2:
         best_f2, best_t = score, t
 
-y_prob_admit = stacking_model.predict_proba(X_test_sel.values)[:, 0]
+y_prob_test_raw = stacking_model.predict_proba(X_test_sel.values)[:, 0]
+y_prob_admit = correct_prior(y_prob_test_raw, train_prior, test_prior)
 prec_tr, rec_tr, _ = precision_recall_curve(y_test, y_prob_admit, pos_label=0)
 y_pred = np.where(y_prob_admit > best_t, 0, 1)
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Bias-Variance
 mse, bias, var = bias_variance_decomp(stacking_model, X_train_sel.values[:500], y_train[:500], X_test_sel.values, y_test, loss='0-1_loss', num_rounds=2, random_seed=42)
@@ -200,8 +311,8 @@ axes[0, 3].axis('off')
 ConfusionMatrixDisplay(confusion_matrix(y_test, y_pred), display_labels=label_enc.classes_).plot(ax=axes[1, 0], cmap='Blues')
 axes[1, 0].set_title('Confusion Matrix')
 
-f2_scorer = make_scorer(fbeta_score, beta=2, pos_label=0)
-ts, tr_s, vl_s = learning_curve(stacking_model, X_train_sel.values, y_train, train_sizes=[0.5, 1.0], cv=2, scoring=f2_scorer)
+f15_scorer = make_scorer(fbeta_score, beta=1.5, pos_label=0)
+ts, tr_s, vl_s = learning_curve(stacking_model, X_train_sel.values, y_train, train_sizes=np.linspace(0.1, 1.0, 5), cv=2, scoring=f15_scorer)
 axes[1, 1].plot(ts, np.mean(tr_s, axis=1), label='Train'); axes[1, 1].plot(ts, np.mean(vl_s, axis=1), label='Val')
 axes[1, 1].set_title('Learning Curve'); axes[1, 1].legend()
 
@@ -210,15 +321,27 @@ axes[1, 2].set_title('Bias-Variance Decomposition')
 
 axes[1, 3].axis('off')
 report = classification_report(y_test, y_pred, target_names=label_enc.classes_)
-metrics_text = f"Best Threshold: {best_t:.2f}\nF2-Score: {fbeta_score(y_test, y_pred, beta=2, pos_label=0):.4f}\n\n{report}"
+metrics_text = f"Best Threshold: {best_t:.2f}\nF1.5-Score: {fbeta_score(y_test, y_pred, beta=1.5, pos_label=0):.4f}\n\n{report}"
 axes[1, 3].text(-0.1, 1.0, metrics_text, fontsize=10, family='monospace', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.5))
 
 model_artifacts = {
     'model': stacking_model,
     'label_encoder': label_enc,
     'preprocessor': preprocessor,
-    'top_100_features': top_100_features,
-    'best_threshold': best_t
+    'features': {
+        'top_100': top_100_features,
+        'engineered': engineered_features,
+        'final_order': X_train_sel.columns.tolist()
+    },
+    'thresholds': {
+        'best_t': best_t,
+        'f15_score_val': best_f2
+    },
+    'metadata': {
+        'train_prior': train_prior,
+        'test_prior': test_prior,
+        'pos_label': 0
+    }
 } 
 
 joblib.dump(model_artifacts, 'models/stacking_model_artifacts.pkl')

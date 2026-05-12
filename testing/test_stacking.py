@@ -4,8 +4,7 @@ import re
 import joblib
 from sklearn.metrics import classification_report, confusion_matrix
 
-# 1. ΦΟΡΤΩΣΗ ARTIFACTS
-# ---------------------------------------------------------
+# Load the artifacts
 artifacts           = joblib.load('models/stacking_model_artifacts.pkl')
 model               = artifacts['model']
 label_enc           = artifacts['label_encoder']
@@ -20,13 +19,12 @@ metadata            = artifacts.get('metadata', {})
 train_prior         = metadata.get('train_prior', 0.30)
 test_prior          = metadata.get('test_prior', 0.15)
 
-# 2. ΣΥΝΑΡΤΗΣΕΙΣ & ΠΡΟΕΤΟΙΜΑΣΙΑ
-# ---------------------------------------------------------
+# function to correct predicted probabilities based on prior shift
 def correct_prior(p, train_prior, test_prior):
     odds = p / (1 - p + 1e-9)
     corrected_odds = odds * (test_prior / train_prior) / ((1 - test_prior) / (1 - train_prior))
     return corrected_odds / (1 + corrected_odds)
-
+# function to engineer features based on the original feature set
 def engineer_features(df):
     d = df.copy()
     if 'num__esi' in d.columns:
@@ -73,12 +71,12 @@ def engineer_features(df):
         d['fe_stealth_elderly'] = ((d['num__age'] >= 65) & (d['num__meds_cardiovascular'] == 0) & (d['num__esi'] == 3)).astype('int8')
     return d
 
-# 3. LOAD TEST SET & PREPROCESS
-# ---------------------------------------------------------
+# Load the test set
 test_set = pd.read_csv('data/1stproject-TestSet.csv')
 X = test_set.drop('disposition', axis=1).copy()
 y = label_enc.transform(test_set['disposition'])
 
+# preprocess the test set using the same preprocessor as the training data
 X_proc = preprocessor.transform(X)
 cols = [re.sub(r'[\[\]<>,:{}\"]', '_', c) for c in preprocessor.get_feature_names_out()]
 X_dum = pd.DataFrame(X_proc, columns=cols, index=X.index)
@@ -92,42 +90,40 @@ X_sel = X_sel[final_feature_order]
 y_prob_raw = model.predict_proba(X_sel.values)[:, 0]
 y_prob     = correct_prior(y_prob_raw, train_prior, test_prior)
 
+# function to apply the multi-tiered FN reduction logic based on engineered features and probability thresholds
 def apply_fn_reduction(prob, X_df, global_t):
-    # Αρχική πρόβλεψη με το βέλτιστο global threshold
+    # Initial prediction with the optimal global threshold
     preds = np.where(prob > global_t, 0, 1)
 
-    # Tier 1: Πολύ επιθετικό threshold (0.02) για την ομάδα "υψηλού κινδύνου FN"
-    # Εδώ στοχεύουμε τον συνδυασμό Κοιλιακού Πόνου + ESI 3 (fe_abdominal_esi3)
+    # Tier 1: Very aggressive threshold (0.02) for the "high FN risk" group
+    # Here we target the combination of Abdominal Pain + ESI 3 (fe_abdominal_esi3)
     high_risk_fn = (X_df.get('fe_abdominal_esi3', 0) == 1).values
     preds[high_risk_fn & (prob > 0.02)] = 0
 
-    # Tier 2: Επιθετικό threshold (0.03) για γενικές FN-prone ομάδες
-    # Εδώ στοχεύουμε το fe_fn_risk και το fe_esi_borderline
+    # Tier 2: Aggressive threshold (0.03) for general FN-prone groups
+    # Here we target the fe_fn_risk and fe_esi_borderline features
     medium_risk_fn = (
         (X_df.get('fe_fn_risk', 0) == 1) | 
         (X_df.get('fe_esi_borderline', 0) == 1)
     ).values
     preds[medium_risk_fn & (prob > 0.03)] = 0
 
-    # Tier 3: Hard Rules (Ακαριαίο Admit)
-    # Ασθενείς με ESI 1 ή 2 θεωρούνται αυτόματα Admit ανεξαρτήτως πιθανότητας
+    # Patients with ESI 1-2 are almost always admitted, so we can safely override to Discharge if the model predicts Admit for them
     if 'num__esi' in X_df.columns:
         preds[(X_df['num__esi'] <= 2).values] = 0
 
-    # Tier 4: Clinical Override (Προστασία ηλικιωμένων με επιβαρυμένη εικόνα)
-    # Αν το fe_frailty_proxy είναι πολύ υψηλό, το Discharge είναι ριψοκίνδυνο
+    # Older patients with high frailty proxy (fe_frailty_proxy) are also at high risk of being false negatives, so we can apply a more aggressive threshold for them
     if 'fe_frailty_proxy' in X_df.columns:
-        # Χρησιμοποιούμε μια τιμή αποκοπής βάσει του Profile Table (π.χ. > 3.0)
+        # We use a threshold based on the Profile Table (e.g., > 3.0)
         frail_risk = (X_df['fe_frailty_proxy'] > 3.0).values
         preds[frail_risk & (prob > 0.05)] = 0
 
     return preds
 
-# Εφαρμογή της νέας λογικής
+# Application of the new logic
 y_pred = apply_fn_reduction(y_prob, X_sel, best_t)
 
-# 5. EVALUATION & CONFUSION MATRIX
-# ---------------------------------------------------------
+# Evaluation 
 print("="*60)
 print(f" PERFORMANCE REPORT | Global Threshold: {best_t:.4f}")
 print("="*60)
@@ -148,8 +144,8 @@ fn = cm[0, 1]
 
 print(f"\n[Summary Counts] TP: {tp} | TN: {tn} | FP: {fp} | FN: {fn}")
 
-# 6. AVERAGE PROFILES PER GROUP
-# ---------------------------------------------------------
+# Used the average profiles so i could analyze the characteristics of the patients the model is missing
+
 analysis_df = test_set.copy()
 analysis_df['True_Label'] = label_enc.inverse_transform(y)
 analysis_df['Pred_Label'] = label_enc.inverse_transform(y_pred)

@@ -255,3 +255,48 @@ The **Soft Voting** model demonstrates a more aggressive prediction strategy, pr
 The **Stacking Classifier** exhibits a more balanced and conservative behavior, maintaining strong recall while substantially reducing unnecessary admission predictions.
 
 Overall, the results indicate that although both models remain robust under distribution shift, the **Stacking approach generalizes more effectively** to Department C by offering a better trade-off between patient safety and operational efficiency.
+
+
+# Installation & Usage
+
+## 1. Clone the Repository
+
+First, clone the repository locally:
+
+```bash
+git clone https://github.com/antonisraf/Triage-Admission-ML.git
+cd Triage-Admission-ML
+```
+
+# Create a Virtual Environment (Recommended)
+
+This project was developed using Python 3.12.6.
+
+## Windows
+
+```bash
+python -m venv venv
+venv\Scripts\activate
+```
+
+## Linux / macOS
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+# Install Dependecies
+All required libraries are included inside the requirements.txt file.
+
+Install them using:
+
+```bash
+pip install -r requirements.txt
+```
+
+# Create The Models Directory 
+
+```bash
+mkdir models
+```
+

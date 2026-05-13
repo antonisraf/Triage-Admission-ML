@@ -107,7 +107,8 @@ The decision threshold was fine-tuned on the validation set to maximize the F2-S
 
 All necessary components (model, preprocessor, feature lists, and threshold) were serialized as `soft_voting_artifacts.pkl` for seamless inference.
 
-![Soft Voting Training Results](plots/soft_voting_eval.png)
+[![Soft Voting Training Results](plots/soft_voting_eval.png)](plots/soft_voting_eval.png)
+
 
 The Soft-Voting Ensemble demonstrates **excellent predictive power (AUC = 0.91)** and is heavily optimized for clinical safety.
 
